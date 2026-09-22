@@ -164,17 +164,22 @@ export async function launch({ port, kill_existing } = {}) {
   const killFirst = kill_existing !== false;
   const platform = process.platform;
 
+  // TRADINGVIEW_PATH env var takes precedence on every platform.
+  const override = process.env.TRADINGVIEW_PATH;
   const pathMap = {
     darwin: [
+      override,
       '/Applications/TradingView.app/Contents/MacOS/TradingView',
       `${process.env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
     ],
     win32: [
+      override,
       `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
       `${process.env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
       `${process.env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
     ],
     linux: [
+      override,
       '/opt/TradingView/tradingview',
       '/opt/TradingView/TradingView',
       `${process.env.HOME}/.local/share/TradingView/TradingView`,
@@ -187,6 +192,18 @@ export async function launch({ port, kill_existing } = {}) {
   const candidates = pathMap[platform] || pathMap.linux;
   for (const p of candidates) {
     if (p && existsSync(p)) { tvPath = p; break; }
+  }
+
+  if (!tvPath && platform === 'win32') {
+    // Microsoft Store (MSIX) install: folder name embeds the version, so resolve it via Get-AppxPackage.
+    try {
+      const loc = execSync(
+        'powershell -NoProfile -Command "(Get-AppxPackage -Name TradingView.Desktop).InstallLocation"',
+        { timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }
+      ).toString().trim().split(/\r?\n/).pop();
+      const candidate = loc ? `${loc}\\TradingView.exe` : null;
+      if (candidate && existsSync(candidate)) tvPath = candidate;
+    } catch { /* not a Store install */ }
   }
 
   if (!tvPath) {
@@ -208,7 +225,7 @@ export async function launch({ port, kill_existing } = {}) {
   }
 
   if (!tvPath) {
-    throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
+    throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.filter(Boolean).join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
   }
 
   if (killFirst) {
