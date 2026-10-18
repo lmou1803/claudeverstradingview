@@ -2,8 +2,10 @@
  * Core health/discovery/launch logic.
  */
 import { getClient, getTargetInfo, evaluate } from '../connection.js';
-import { existsSync } from 'fs';
+import { existsSync, rmSync } from 'fs';
 import { execSync, spawn } from 'child_process';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 export async function healthCheck() {
   await getClient();
@@ -159,6 +161,36 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
+/**
+ * Launch TradingView on Windows so it outlives this process.
+ *
+ * spawn(detached) is not enough here: the MCP server runs inside the CLI's job
+ * object, and on Windows a child inherits that job regardless of `detached`, so
+ * TradingView gets killed the moment the Claude session restarts. Handing the
+ * launch to the shell instead (a transient explorer.exe forwards it over DCOM)
+ * reparents TradingView under the shell, outside our job.
+ *
+ * Arguments cannot be passed to explorer.exe directly, so they travel in a
+ * throwaway .lnk. Returns that path for cleanup.
+ */
+function launchViaShell(tvPath, cdpPort) {
+  const lnkPath = join(tmpdir(), `tv-cdp-${cdpPort}.lnk`);
+  // Values go through the environment to avoid quoting issues with spaces.
+  execSync(
+    'powershell -NoProfile -Command "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TV_LNK); $s.TargetPath = $env:TV_EXE; $s.Arguments = $env:TV_ARGS; $s.Save()"',
+    {
+      timeout: 15000,
+      stdio: 'ignore',
+      env: { ...process.env, TV_LNK: lnkPath, TV_EXE: tvPath, TV_ARGS: `--remote-debugging-port=${cdpPort}` },
+    }
+  );
+  if (!existsSync(lnkPath)) throw new Error('could not create launcher shortcut');
+
+  const child = spawn('explorer.exe', [lnkPath], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return lnkPath;
+}
+
 export async function launch({ port, kill_existing } = {}) {
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;
@@ -236,8 +268,22 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* may not be running */ }
   }
 
-  const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
-  child.unref();
+  let lnkPath = null;
+  let pid = null;
+  let detachedFromSession = false;
+
+  if (platform === 'win32') {
+    try {
+      lnkPath = launchViaShell(tvPath, cdpPort);
+      detachedFromSession = true;
+    } catch { /* fall back to a direct spawn below */ }
+  }
+
+  if (!detachedFromSession) {
+    const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
+    child.unref();
+    pid = child.pid;
+  }
 
   for (let i = 0; i < 15; i++) {
     await new Promise(r => setTimeout(r, 1000));
@@ -252,17 +298,32 @@ export async function launch({ port, kill_existing } = {}) {
       });
       if (ready) {
         const info = JSON.parse(ready);
+        if (lnkPath) {
+          try { rmSync(lnkPath, { force: true }); } catch { /* best effort */ }
+          // The shell owns the process, so look the pid up instead of reading it off a child handle.
+          try {
+            const out = execSync('tasklist /FI "IMAGENAME eq TradingView.exe" /NH /FO CSV', { timeout: 5000 }).toString();
+            const match = out.match(/"TradingView\.exe","(\d+)"/);
+            if (match) pid = Number(match[1]);
+          } catch { /* pid stays null */ }
+        }
         return {
-          success: true, platform, binary: tvPath, pid: child.pid,
+          success: true, platform, binary: tvPath, pid,
           cdp_port: cdpPort, cdp_url: `http://localhost:${cdpPort}`,
           browser: info.Browser, user_agent: info['User-Agent'],
+          detached_from_session: detachedFromSession,
         };
       }
     } catch { /* retry */ }
   }
 
+  if (lnkPath) {
+    try { rmSync(lnkPath, { force: true }); } catch { /* best effort */ }
+  }
+
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: true, platform, binary: tvPath, pid, cdp_port: cdpPort, cdp_ready: false,
+    detached_from_session: detachedFromSession,
     warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
   };
 }
